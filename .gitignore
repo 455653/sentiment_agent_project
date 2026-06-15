@@ -1,0 +1,11 @@
+.idea/
+.chainlit/
+__pycache__/
+*.py[cod]
+
+# Training artifacts
+*.pth
+*.pkl
+*.png
+results_comparison.csv
+best_model_info.json
