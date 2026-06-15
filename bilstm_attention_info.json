@@ -1,0 +1,12 @@
+{
+  "model_name": "BiLSTMWithAttention",
+  "config": {
+    "vocab_size": 20002,
+    "embedding_dim": 128,
+    "hidden_size": 128,
+    "attention_dim": 128,
+    "num_classes": 2,
+    "dropout": 0.3,
+    "padding_idx": 0
+  }
+}

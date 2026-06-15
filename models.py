@@ -1,4 +1,4 @@
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -272,6 +272,76 @@ class BiLSTMModel(BaseTextClassifier):
         return logits
 
 
+class BiLSTMWithAttention(BaseTextClassifier):
+    """
+    BiLSTMWithAttention 结构：
+    Embedding -> 双向 LSTM -> Bahdanau 风格注意力 -> 加权求和 -> Dropout -> 全连接分类
+
+    设计思路：
+    - 双向 LSTM 会为每个时间步输出一个上下文相关表示；
+    - 注意力层不再只看“最后一个时间步”，而是让模型自动学习：
+      哪些词对当前情感判断更重要；
+    - 最终同时返回分类 logits 和 attention_weights，
+      便于后续做可视化分析。
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        embedding_dim: int = 128,
+        hidden_size: int = 128,
+        attention_dim: int = 128,
+        num_classes: int = 2,
+        dropout: float = 0.3,
+        padding_idx: int = 0,
+        pretrained_embedding: Optional[TensorLike] = None,
+    ):
+        super().__init__(
+            vocab_size=vocab_size,
+            embedding_dim=embedding_dim,
+            num_classes=num_classes,
+            dropout=dropout,
+            padding_idx=padding_idx,
+            pretrained_embedding=pretrained_embedding,
+        )
+        self.hidden_size = hidden_size
+        self.attention_dim = attention_dim
+        self.lstm = nn.LSTM(
+            input_size=embedding_dim,
+            hidden_size=hidden_size,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.attention_proj = nn.Linear(hidden_size * 2, attention_dim)
+        self.attention_score = nn.Linear(attention_dim, 1, bias=False)
+        self.fc = nn.Linear(hidden_size * 2, num_classes)
+
+    def forward(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        embedded = self.dropout(self.embedding(input_ids))
+        lstm_output, _ = self.lstm(embedded)
+
+        # Bahdanau 风格注意力的核心思想：
+        # 1. 先把每个时间步的隐藏状态 h_t 投影到一个更小的注意力空间；
+        # 2. 经过 tanh 引入非线性，学习“这个时间步是否重要”的中间表示；
+        # 3. 再映射成一个标量分数 score_t；
+        # 4. 对整句所有时间步的分数做 softmax，得到归一化注意力权重。
+        attention_hidden = torch.tanh(self.attention_proj(lstm_output))
+        attention_scores = self.attention_score(attention_hidden).squeeze(-1)
+
+        # padding 位置不应该参与注意力分配，因此这里用 mask 把它们压到极小值。
+        padding_mask = input_ids.ne(self.padding_idx)
+        attention_scores = attention_scores.masked_fill(~padding_mask, torch.finfo(attention_scores.dtype).min)
+
+        attention_weights = torch.softmax(attention_scores, dim=1)
+
+        # 用注意力权重对所有时间步的双向 LSTM 输出做加权求和，
+        # 得到整条句子的表示向量 context。
+        context = torch.bmm(attention_weights.unsqueeze(1), lstm_output).squeeze(1)
+        logits = self.fc(self.dropout(context))
+        return logits, attention_weights
+
+
 class TextCNN(BaseTextClassifier):
     """
     TextCNN 结构：
@@ -339,5 +409,6 @@ __all__ = [
     "LSTMModel",
     "GRUModel",
     "BiLSTMModel",
+    "BiLSTMWithAttention",
     "TextCNN",
 ]

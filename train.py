@@ -21,7 +21,7 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader
 
 from data_preprocessing import SentimentDataset
-from models import BiLSTMModel, GRUModel, LSTMModel, SimpleRNN, TextCNN
+from models import BiLSTMModel, BiLSTMWithAttention, GRUModel, LSTMModel, SimpleRNN, TextCNN
 
 
 def set_seed(seed: int) -> None:
@@ -59,6 +59,20 @@ def calculate_metrics(y_true: List[int], y_pred: List[int]) -> Dict[str, float]:
     }
 
 
+def extract_logits(model_output):
+    """
+    兼容两种 forward 返回形式：
+    - 普通分类模型：直接返回 logits
+    - 注意力模型：返回 (logits, attention_weights)
+
+    训练和评估时只需要 logits 参与损失计算与预测，
+    因此这里统一抽取第一个返回值。
+    """
+    if isinstance(model_output, tuple):
+        return model_output[0]
+    return model_output
+
+
 def run_validation(
     model: nn.Module,
     data_loader: DataLoader,
@@ -78,7 +92,7 @@ def run_validation(
             input_ids = input_ids.to(device)
             labels = labels.to(device)
 
-            logits = model(input_ids)
+            logits = extract_logits(model(input_ids))
             loss = criterion(logits, labels)
 
             total_loss += loss.item() * input_ids.size(0)
@@ -136,7 +150,7 @@ def train_model(
             labels = labels.to(device)
 
             optimizer.zero_grad()
-            logits = model(input_ids)
+            logits = extract_logits(model(input_ids))
             loss = criterion(logits, labels)
             loss.backward()
             optimizer.step()
@@ -222,6 +236,9 @@ def build_model(model_name: str, vocab_size: int, pretrained_embedding=None) -> 
     elif model_name == "BiLSTMModel":
         config = {**common_config, "hidden_size": 128}
         model = BiLSTMModel(**config)
+    elif model_name == "BiLSTMWithAttention":
+        config = {**common_config, "hidden_size": 128, "attention_dim": 128}
+        model = BiLSTMWithAttention(**config)
     elif model_name == "TextCNN":
         config = {**common_config, "num_filters": 128, "kernel_sizes": (2, 3, 4)}
         model = TextCNN(**config)
