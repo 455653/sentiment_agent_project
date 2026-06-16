@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -12,8 +13,6 @@ WELCOME_MESSAGE = (
     "欢迎使用电商评论智能分析系统，\n"
     "请上传一个包含评论的txt文件（每行一条评论），或直接粘贴评论文本（每行一条）"
 )
-MAX_REVIEW_COUNT = 30
-RECOMMENDED_REVIEW_RANGE = "20-30"
 CHAINLIT_VERSION_HINT = "建议安装 `chainlit>=1.0,<2.0`"
 
 
@@ -26,20 +25,34 @@ def parse_reviews(text: str) -> List[str]:
 
 def normalize_reviews(reviews: List[str]) -> tuple[List[str], List[str]]:
     """
-    对评论数量做友好提示。
-    超过 30 条时保留前 30 条，避免分析时间过长。
+    验证评论数量并给出提示。
+    - 无硬截断，允许传入任意数量
+    - 去重并过滤空行
+    - 超过 5000 条时给出"处理可能需要较长时间"的提示
+    - 超过 10000 条时给出"建议分批处理"的提示，但不强制截断
     """
     notices: List[str] = []
-    normalized_reviews = reviews
+    unique_reviews: List[str] = []
+    seen: set[str] = set()
 
-    if len(reviews) > MAX_REVIEW_COUNT:
-        notices.append(
-            f"建议输入 {RECOMMENDED_REVIEW_RANGE} 条评论以获得最佳分析效果和速度，"
-            f"当前收到 {len(reviews)} 条，系统将先截取前 {MAX_REVIEW_COUNT} 条继续分析。"
-        )
-        normalized_reviews = reviews[:MAX_REVIEW_COUNT]
+    for review in reviews:
+        normalized = review.strip()
+        if not normalized:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        unique_reviews.append(normalized)
 
-    return normalized_reviews, notices
+    if len(unique_reviews) < len(reviews):
+        notices.append(f"已自动去重并过滤空行：{len(reviews)} -> {len(unique_reviews)} 条。")
+
+    if len(unique_reviews) > 10000:
+        notices.append("评论数量超过 10000 条，建议分批处理以降低失败风险。")
+    elif len(unique_reviews) > 5000:
+        notices.append("评论数量超过 5000 条，处理可能需要较长时间，请耐心等待。")
+
+    return unique_reviews, notices
 
 
 def read_txt_file(file_path: str) -> str:
@@ -109,34 +122,62 @@ def run_crew_analysis_sync(reviews_text: str) -> Dict[str, Any]:
 
 async def process_reviews(reviews: List[str], source_name: str) -> None:
     """
-    统一处理评论输入，并把多阶段分析结果发送到页面。
+    处理流程：
+    1. "正在解析 {N} 条评论..."
+    2. "正在进行批量情感分类（本地模型），共 {N} 条评论..."
+    3. "情感分类完成：正面 X 条，负面 Y 条"
+    4. "Agent 1 正在分析统计数据..."
+    5. "Agent 2 正在提炼问题洞察..."
+    6. "Agent 3 正在撰写分析报告..."
+    7. 展示最终报告
     """
-    clean_reviews = [review.strip() for review in reviews if review.strip()]
-    if not clean_reviews:
+    await cl.Message(content=f"正在解析 {len(reviews)} 条评论...").send()
+
+    if not reviews:
         await cl.Message(content="没有解析到有效评论，请重新上传 txt 文件或粘贴多行评论文本。").send()
         return
 
-    normalized_reviews, notices = normalize_reviews(clean_reviews)
+    normalized_reviews, notices = normalize_reviews(reviews)
+    if not normalized_reviews:
+        await cl.Message(content="没有解析到有效评论，请重新上传 txt 文件或粘贴多行评论文本。").send()
+        return
+
     for notice in notices:
         await cl.Message(content=notice).send()
 
     await cl.Message(
         content=f"已接收来自 {source_name} 的 {len(normalized_reviews)} 条评论。"
     ).send()
-    await cl.Message(content=f"正在分析 {len(normalized_reviews)} 条评论，请稍候...").send()
+    await cl.Message(
+        content=f"正在进行批量情感分类（本地模型），共 {len(normalized_reviews)} 条评论..."
+    ).send()
 
     try:
         async_run_crew = cl.make_async(run_crew_analysis_sync)
         analysis_result = await async_run_crew("\n".join(normalized_reviews))
     except Exception as exc:
-        await cl.Message(content=f"分析过程中出现错误：{exc}").send()
+        await cl.Message(content=f"分析失败：{exc}").send()
         return
 
-    for stage_message in build_stage_messages(analysis_result):
+    stage_messages = build_stage_messages(analysis_result)
+
+    stage1_content = stage_messages[0]["content"] if len(stage_messages) >= 1 else ""
+    positive_match = re.search(r"正面\s*(\d+)\s*条", stage1_content)
+    negative_match = re.search(r"负面\s*(\d+)\s*条", stage1_content)
+    if positive_match and negative_match:
         await cl.Message(
-            author=stage_message["author"],
-            content=stage_message["content"],
+            content=f"情感分类完成：正面 {positive_match.group(1)} 条，负面 {negative_match.group(1)} 条"
         ).send()
+
+    if len(stage_messages) >= 1:
+        await cl.Message(content="Agent 1 正在分析统计数据...").send()
+        await cl.Message(author=stage_messages[0]["author"], content=stage_messages[0]["content"]).send()
+
+    if len(stage_messages) >= 2:
+        await cl.Message(content="Agent 2 正在提炼问题洞察...").send()
+        await cl.Message(author=stage_messages[1]["author"], content=stage_messages[1]["content"]).send()
+
+    await cl.Message(content="Agent 3 正在撰写分析报告...").send()
 
     final_report = str(analysis_result.get("final_report", "")).strip() or "未生成最终报告。"
     await cl.Message(content=final_report, author="最终分析报告").send()
@@ -170,7 +211,7 @@ async def prompt_txt_upload() -> None:
     uploaded_files = await cl.AskFileMessage(
         content="如需上传评论文件，请选择一个 txt 文件；如果你想直接粘贴评论，也可以忽略这个上传框。",
         accept={"text/plain": [".txt"]},
-        max_size_mb=5,
+        max_size_mb=20,
         max_files=1,
         timeout=120,
         raise_on_timeout=False,

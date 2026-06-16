@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import pickle
 import random
@@ -16,7 +17,7 @@ from sentiment_predictor import SentimentPredictor
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_MODEL = "deepseek/deepseek-chat"
-SENTIMENT_TOOL_NAME = "sentiment_analysis_tool"
+BATCH_SENTIMENT_TOOL_NAME = "sentiment_batch_analysis_tool"
 _predictor: Optional[SentimentPredictor] = None
 
 
@@ -56,24 +57,74 @@ def get_predictor() -> SentimentPredictor:
     return _predictor
 
 
-@tool(SENTIMENT_TOOL_NAME)
-def sentiment_analysis_tool(text: str) -> str:
+@tool(BATCH_SENTIMENT_TOOL_NAME)
+def sentiment_batch_analysis_tool(reviews_text: str) -> str:
     """
-    情感分析工具：对单条电商评论进行情感分析。
-    输入一条中文评论，返回情感标签和置信度字符串。
+    批量情感分析工具：一次性对所有评论进行情感分类。
+    输入：多行评论文本，每行一条评论（用 \\n 分隔）
+    输出：JSON 字符串（ensure_ascii=False），包含：
+      {
+        "total": 总条数,
+        "positive": 正面条数,
+        "negative": 负面条数,
+        "positive_ratio": 正面占比(浮点数,如0.7234),
+        "results": [每条 {"text": "原文", "label": "正面/负面", "confidence": 0.xxxx}],
+        "representative_samples": {
+          "positive_high_conf": [...高置信度正面样例(前3条)...],
+          "positive_low_conf": [...低置信度正面样例(前3条)...],
+          "negative_high_conf": [...高置信度负面样例(前3条)...],
+          "negative_low_conf": [...低置信度负面样例(前3条)...]
+        }
+      }
     """
-    review = text.strip()
-    if not review:
-        return "情感分析失败: 输入文本为空"
-
-    print(f"[工具] 正在分析评论: {review}")
     try:
-        result = get_predictor().predict(review)
-        return f"情感: {result['label']}, 置信度: {result['confidence']:.4f}"
+        reviews = [line.strip() for line in reviews_text.splitlines() if line.strip()]
+        if not reviews:
+            return json.dumps({"error": "输入评论为空，请提供每行一条评论的文本。"}, ensure_ascii=False)
+
+        print(f"[工具] 正在进行批量情感分析，共 {len(reviews)} 条评论...")
+        batch_results = get_predictor().predict_batch(reviews, batch_size=128)
+
+        results = [
+            {
+                "text": str(item.get("text", "")),
+                "label": str(item.get("label", "")),
+                "confidence": float(item.get("confidence", 0.0)),
+            }
+            for item in batch_results
+        ]
+
+        positive = [r for r in results if r["label"] == "正面"]
+        negative = [r for r in results if r["label"] == "负面"]
+
+        positive_high = sorted(positive, key=lambda x: x["confidence"], reverse=True)[:3]
+        positive_low = sorted(positive, key=lambda x: x["confidence"])[:3]
+        negative_high = sorted(negative, key=lambda x: x["confidence"], reverse=True)[:3]
+        negative_low = sorted(negative, key=lambda x: x["confidence"])[:3]
+
+        total = len(results)
+        positive_count = len(positive)
+        negative_count = len(negative)
+        positive_ratio = round(positive_count / total, 4) if total else 0.0
+
+        payload = {
+            "total": total,
+            "positive": positive_count,
+            "negative": negative_count,
+            "positive_ratio": positive_ratio,
+            "results": results,
+            "representative_samples": {
+                "positive_high_conf": positive_high,
+                "positive_low_conf": positive_low,
+                "negative_high_conf": negative_high,
+                "negative_low_conf": negative_low,
+            },
+        }
+
+        print("[工具] 批量情感分析完成。")
+        return json.dumps(payload, ensure_ascii=False)
     except Exception as exc:
-        error_message = f"情感分析工具执行失败: {exc}"
-        print(f"[工具] {error_message}")
-        raise RuntimeError(error_message) from exc
+        return json.dumps({"error": f"批量情感分析失败：{exc}"}, ensure_ascii=False)
 
 
 def create_agents(llm: LLM) -> tuple[Agent, Agent, Agent]:
@@ -84,7 +135,7 @@ def create_agents(llm: LLM) -> tuple[Agent, Agent, Agent]:
         role="电商评论数据分析员",
         goal="对一批评论逐条进行情感分类，统计正负面比例",
         backstory="你是一位细致严谨的数据分析专家，擅长逐条核对评论并输出可复核的统计结论。",
-        tools=[sentiment_analysis_tool],
+        tools=[sentiment_batch_analysis_tool],
         llm=llm,
         verbose=True,
         allow_delegation=False,
@@ -118,24 +169,25 @@ def create_tasks(data_analyst: Agent, insight_analyst: Agent, report_writer: Age
     task1 = Task(
         description=(
             "你会收到变量 {reviews}，其中包含一批电商评论文本，多条评论之间以换行分隔。\n"
-            f"请逐条调用工具 {SENTIMENT_TOOL_NAME} 进行分类，不要凭空猜测。"
-            "这个工具对应的中文用途是“情感分析工具”。\n"
-            "如果工具调用失败，请停止统计，并明确输出失败原因。\n"
-            "输出内容至少包括：\n"
-            "1. 每条评论的情感判断结果；\n"
-            "2. 汇总统计：正面X条，负面Y条，正面占比Z%；\n"
-            "3. 负面评论原文列表；\n"
-            "4. 正面评论原文列表，供后续优点分析使用。"
+            f"请使用批量情感分析工具 {BATCH_SENTIMENT_TOOL_NAME}，一次性对所有评论进行分类。"
+            "不要逐条调用工具！调用一次即可。\n"
+            "工具会返回一个 JSON，包含所有评论的分类结果、汇总统计和代表样例。\n"
+            "如果 JSON 中包含 error 字段，请停止后续分析并输出失败原因。\n"
+            "你需要输出：\n"
+            "1. 汇总统计：正面X条（占Y%），负面Z条（占W%）；\n"
+            "2. 代表样例分析：简要说明高置信度正/负面和低置信度正/负面分别反映了什么特点；\n"
+            "3. 不要逐条列出所有评论的结果（数量太多）。"
         ),
-        expected_output="一段包含逐条情感结果、整体统计、负面评论列表和正面评论列表的中文文本。",
+        expected_output="一段包含情感分布统计和代表样例分析的中文文本，不包含逐条结果。",
         agent=data_analyst,
     )
 
     task2 = Task(
         description=(
-            "基于上一个任务的输出，分析负面评论中反复出现的问题点，"
+            "基于数据分析员输出的统计结果和代表样例，分析这批评论中反映的主要问题点和优点。"
             "从物流、质量、客服、包装、使用体验等维度归纳出 3-5 个主要问题；"
-            "同时结合正面评论，简要总结用户称赞的优点。"
+            "同时总结用户称赞的优点。注意代表样例中低置信度的评论可能反映模棱两可的情况，"
+            "请特别留意。"
         ),
         expected_output="一段包含主要问题点、原因归纳和优点总结的中文文本。",
         agent=insight_analyst,

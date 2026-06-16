@@ -4,6 +4,7 @@ import pickle
 from typing import Dict, List
 
 import torch
+from torch.utils.data import DataLoader, TensorDataset
 
 from models import BiLSTMModel, BiLSTMWithAttention, GRUModel, LSTMModel, SimpleRNN, TextCNN
 
@@ -118,6 +119,70 @@ class SentimentPredictor:
             "label": "正面" if pred_idx == 1 else "负面",
             "confidence": confidence,
         }
+
+    def predict_batch(self, texts: List[str], batch_size: int = 128) -> List[dict]:
+        """
+        批量预测多条文本。
+        返回格式：[{"index": 0, "text": "...", "label": "正面", "confidence": 0.9234}, ...]
+        - 内部用 DataLoader 分 batch 推理
+        - 使用 torch.no_grad() + model.eval()
+        - batch_size 默认为 128
+        """
+        if jieba is None:
+            raise ImportError("当前环境未安装 jieba，请先执行：pip install jieba") from _jieba_import_error
+
+        if batch_size <= 0:
+            raise ValueError("batch_size 必须为正整数")
+
+        if not texts:
+            return []
+
+        cleaned_texts = [str(text) for text in texts]
+
+        try:
+            input_ids_list: List[List[int]] = []
+            for text in cleaned_texts:
+                tokens: List[str] = [token.strip() for token in jieba.lcut(text) if token.strip()]
+                input_ids = [self.word2idx.get(token, self.unk_idx) for token in tokens]
+                input_ids = input_ids[: self.max_len]
+                if len(input_ids) < self.max_len:
+                    input_ids = input_ids + [self.pad_idx] * (self.max_len - len(input_ids))
+                input_ids_list.append(input_ids)
+
+            all_input_ids = torch.tensor(input_ids_list, dtype=torch.long)
+            dataset = TensorDataset(all_input_ids)
+            dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+
+            self.model.eval()
+            results: List[dict] = []
+            offset = 0
+
+            with torch.no_grad():
+                for (batch_input_ids,) in dataloader:
+                    batch_input_ids = batch_input_ids.to(self.device)
+                    logits = self._extract_logits(self.model(batch_input_ids))
+                    probs = torch.softmax(logits, dim=1)
+                    pred_idx = torch.argmax(probs, dim=1)
+
+                    batch_indices = pred_idx.tolist()
+                    batch_confidences = probs[torch.arange(probs.size(0)), pred_idx].tolist()
+
+                    for i, (pred, conf) in enumerate(zip(batch_indices, batch_confidences)):
+                        global_index = offset + i
+                        results.append(
+                            {
+                                "index": global_index,
+                                "text": cleaned_texts[global_index],
+                                "label": "正面" if int(pred) == 1 else "负面",
+                                "confidence": round(float(conf), 4),
+                            }
+                        )
+
+                    offset += len(batch_indices)
+
+            return results
+        except Exception as exc:
+            raise RuntimeError(f"批量情感预测失败：{exc}") from exc
 
 
 if __name__ == "__main__":
